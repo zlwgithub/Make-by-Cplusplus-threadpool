@@ -7,10 +7,11 @@
 #include <future>
 #include <thread>
 #include <mutex>
+#include <unordered_map>
 #include <condition_variable>
 using namespace std;
 
-const int TASK_MAX_THRESHHOLD = 20;
+const int TASK_MAX_THRESHHOLD = 30;
 const int THREAD_MAX_THRESHHOLD = 1024;
 const int THREAD_MAX_IDLE_TIME = 60;
 
@@ -23,21 +24,29 @@ enum class PoolMode
 class Thread
 {
 public:
-    using ThreadFunc = function<void()>;
+    using ThreadFunc = function<void(int)>;
 
-    Thread(ThreadFunc func) : func_(func) {}
+    Thread(ThreadFunc func) : func_(func), threadId_(generateId_++) {}
     ~Thread() = default;
 
     void start()
     {
-        thread t(func_);
+        thread t(func_, threadId_);
         t.detach();
-        // thread(func_).detach();
+    }
+
+    int getId()
+    {
+        return threadId_;
     }
 
 private:
     ThreadFunc func_;
+    int threadId_;
+    static int generateId_;
 };
+
+int Thread::generateId_ = 0;
 
 class ThreadPool
 {
@@ -92,8 +101,9 @@ public:
 
         for (int i = 0; i < initThreadSize_; ++i)
         {
-            auto ptr = make_unique<Thread>(bind(&ThreadPool::threadFunc, this));
-            threads_.emplace_back(move(ptr));
+            auto ptr = make_unique<Thread>(bind(&ThreadPool::threadFunc, this, placeholders::_1));
+            int threadId = ptr->getId();
+            threads_.emplace(threadId, move(ptr));
         }
         for (int i = 0; i < initThreadSize_; ++i)
         {
@@ -110,7 +120,7 @@ public:
         future<Rtype> result = task->get_future();
 
         unique_lock<mutex> lock(taskQueMtx_);
-        if (!notFull_.wait_for(lock, chrono::milliseconds(5000), [&]()
+        if (!notFull_.wait_for(lock, chrono::milliseconds(100), [&]()
                                { return taskQue_.size() < (size_t)TASK_MAX_THRESHHOLD; }))
         {
             cerr << "任务提交失败." << endl;
@@ -123,14 +133,32 @@ public:
         taskQue_.emplace([task]()
                          { (*task)(); });
         taskSize_++;
-
         notEmpty_.notify_all();
+
+        if (poolMode_ == PoolMode::MODE_CACHED && taskSize_ > idleThreadSize_ && curThreadSize_ < threadSizeThreshHold_)
+        {
+            cout << ">>> create new thread... <<<" << endl;
+
+            int createingThreadSize = min(threadSizeThreshHold_ - curThreadSize_, taskSize_ - idleThreadSize_) / 2 + 1;
+            for (int i = 0; i < createingThreadSize; ++i)
+            {
+                auto ptr = make_unique<Thread>(bind(&ThreadPool::threadFunc, this, placeholders::_1));
+                int threadId = ptr->getId();
+                threads_.emplace(threadId, move(ptr));
+                threads_[threadId]->start();
+
+                curThreadSize_++;
+                idleThreadSize_++;
+            }
+        }
 
         return result;
     }
 
-    void threadFunc()
+    void threadFunc(int threadid)
     {
+        auto lasttime = chrono::high_resolution_clock().now();
+
         for (;;)
         {
             Task task;
@@ -144,14 +172,31 @@ public:
                         // 线程池要结束了
                         curThreadSize_--;
                         idleThreadSize_--;
+                        threads_.erase(threadid);
+                        cout << "tid: " << this_thread::get_id() << "退出!" << endl;
                         exitCond_.notify_all();
                         return;
                     }
-                    // if (poolMode_ == PoolMode::MODE_CACHED)
-                    // {
-                    // }
-
-                    notEmpty_.wait(lock);
+                    if (poolMode_ == PoolMode::MODE_CACHED)
+                    {
+                        if (cv_status::timeout == notEmpty_.wait_for(lock, chrono::seconds(1)))
+                        {
+                            auto now = chrono::high_resolution_clock().now();
+                            auto dur = chrono::duration_cast<chrono::seconds>(now - lasttime);
+                            if (dur.count() >= THREAD_MAX_IDLE_TIME && curThreadSize_ > initThreadSize_)
+                            {
+                                threads_.erase(threadid);
+                                curThreadSize_--;
+                                idleThreadSize_--;
+                                cout << "tid: " << this_thread::get_id() << "退出!" << endl;
+                                return;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        notEmpty_.wait(lock);
+                    }
                 }
 
                 idleThreadSize_--;
@@ -175,6 +220,7 @@ public:
                 cout << "tid: " << this_thread::get_id() << "完成任务,开始获取下一任务" << endl;
             }
             idleThreadSize_++;
+            auto lasttime = chrono::high_resolution_clock().now();
         }
     }
 
@@ -189,7 +235,7 @@ private:
     atomic_int taskSize_;
     int taskQueMaxThreshHold_;
 
-    vector<unique_ptr<Thread>> threads_;
+    unordered_map<int, unique_ptr<Thread>> threads_;
 
     mutex taskQueMtx_;
     condition_variable notFull_;
